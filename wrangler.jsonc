@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mobile-harness-codecraft-proxy",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-20",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "REQUIRE_PROXY_TOKEN": "1",
+    "UPSTREAM_BASE_URL": "https://codecraftapi.com/v1",
+    "DEFAULT_MODEL": "claude-opus-5.5",
+    "MODEL_MAP_JSON": "{}",
+    "MAX_REQUEST_BYTES": "20000000",
+    "ESTIMATE_TOKENS_PER_CHAR": "0.25"
+  }
+}

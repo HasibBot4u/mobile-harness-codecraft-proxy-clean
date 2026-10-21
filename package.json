@@ -1,0 +1,21 @@
+{
+  "name": "mobile-harness-codecraft-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A token-protected Cloudflare Worker translating Anthropic Messages API to a fixed OpenAI-compatible CodeCraft endpoint.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail mobile-harness-codecraft-proxy"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "vitest": "5.0.5",
+    "wrangler": "4.151.2"
+  }
+}
