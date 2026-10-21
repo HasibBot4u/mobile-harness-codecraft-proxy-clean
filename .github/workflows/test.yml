@@ -11,16 +11,23 @@ permissions:
 
 jobs:
   test:
-    name: Unit tests
+    name: Unit tests and Worker validation
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24
+
       - name: Install dependencies
         run: npm install --no-audit --no-fund
+
       - name: Run tests
         run: npm test
+
+      - name: Validate Worker bundle without deployment
+        run: npx wrangler deploy --dry-run
