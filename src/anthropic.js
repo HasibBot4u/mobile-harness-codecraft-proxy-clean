@@ -4,6 +4,17 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+const SUPPORTED_INPUT_ROLES = new Set([
+  "user",
+  "assistant",
+  "system",
+  "developer",
+  "tool",
+  "function",
+]);
+
+const PERMITTED_UPSTREAM_ROLES = new Set(["user", "assistant"]);
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -14,7 +25,7 @@ function textFromContent(content) {
       if (block.type === "text" && typeof block.text === "string") return block.text;
       if (block.type === "image") return "[image content]";
       if (block.type === "tool_result") {
-        const nested = block.content;
+        const nested = block.content ?? block.output;
         return typeof nested === "string" ? nested : textFromContent(nested);
       }
       return "";
@@ -23,20 +34,39 @@ function textFromContent(content) {
     .join("\n");
 }
 
+function extractInstructionText(value, label = "system") {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "string") return value.trim();
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be a string or an array of text blocks.`);
+  }
+
+  const parts = [];
+  for (const block of value) {
+    if (!isPlainObject(block) || block.type !== "text" || typeof block.text !== "string") {
+      throw new TypeError(`Invalid ${label} content block: only text blocks with string text are supported.`);
+    }
+    if (block.text) parts.push(block.text);
+  }
+  return parts.join("\n").trim();
+}
+
 function anthropicImageToOpenAI(block) {
   const source = block?.source;
-  if (!source || typeof source !== "object") return null;
+  if (!isPlainObject(source)) return null;
 
-  if (source.type === "base64" && typeof source.data === "string" && source.data) {
-    const mediaType = typeof source.media_type === "string" ? source.media_type : "image/png";
+  if (source.type === "base64" && typeof source.data === "string" && source.data.trim()) {
+    const mediaType = typeof source.media_type === "string" && source.media_type.trim()
+      ? source.media_type.trim()
+      : "image/png";
     return {
       type: "image_url",
-      image_url: { url: `data:${mediaType};base64,${source.data}` },
+      image_url: { url: `data:${mediaType};base64,${source.data.trim()}` },
     };
   }
 
-  if (source.type === "url" && typeof source.url === "string" && source.url) {
-    return { type: "image_url", image_url: { url: source.url } };
+  if (source.type === "url" && typeof source.url === "string" && source.url.trim()) {
+    return { type: "image_url", image_url: { url: source.url.trim() } };
   }
 
   return null;
@@ -75,14 +105,139 @@ function mapToolDefinitions(tools) {
     }));
 }
 
-function toolResultAsText(block) {
-  const value = block?.content ?? block?.output ?? "";
-  if (typeof value === "string") return value;
-  return textFromContent(value) || JSON.stringify(value);
+function toolResultContentToParts(rawContent) {
+  if (rawContent === undefined || rawContent === null) {
+    return { text: "", images: [] };
+  }
+  if (typeof rawContent === "string") {
+    return { text: rawContent, images: [] };
+  }
+  if (Array.isArray(rawContent)) {
+    const textLines = [];
+    const images = [];
+    for (const item of rawContent) {
+      if (!isPlainObject(item) || typeof item.type !== "string") {
+        throw new TypeError("Malformed content block inside tool result.");
+      }
+      if (item.type === "text") {
+        if (typeof item.text !== "string") {
+          throw new TypeError("Tool result text block must have a string text field.");
+        }
+        textLines.push(item.text);
+      } else if (item.type === "image") {
+        const mappedImage = anthropicImageToOpenAI(item);
+        if (!mappedImage) {
+          throw new TypeError("Unsupported or malformed image content block inside tool result.");
+        }
+        images.push(mappedImage);
+      } else {
+        throw new TypeError(
+          `Unsupported content block type "${item.type.slice(0, 64)}" inside tool result.`,
+        );
+      }
+    }
+    return { text: textLines.join("\n"), images };
+  }
+  if (isPlainObject(rawContent)) {
+    return { text: JSON.stringify(rawContent), images: [] };
+  }
+  if (typeof rawContent === "number" || typeof rawContent === "boolean") {
+    return { text: String(rawContent), images: [] };
+  }
+  throw new TypeError("Malformed tool result content.");
 }
 
-function serializeUnmatchedToolResult(block) {
-  return `[Tool result for ${block?.tool_use_id || "unknown tool"}]\n${toolResultAsText(block)}`;
+function formatToolResultMessage({ id, name, text, isError = false, matched = true }) {
+  const cleanName = typeof name === "string" && name.trim() ? name.trim() : "";
+  const cleanId = typeof id === "string" && id.trim() ? id.trim() : "";
+
+  let header;
+  if (matched) {
+    if (cleanName && cleanId) {
+      header = `[Tool result: ${cleanName}, call_id=${cleanId}]`;
+    } else if (cleanName) {
+      header = `[Tool result: ${cleanName}]`;
+    } else if (cleanId) {
+      header = `[Tool result: call_id=${cleanId}]`;
+    } else {
+      header = "[Tool result]";
+    }
+  } else if (cleanName && cleanId) {
+    header = `[Tool result (unmatched): ${cleanName}, call_id=${cleanId}]`;
+  } else if (cleanName) {
+    header = `[Tool result (unmatched): ${cleanName}]`;
+  } else {
+    header = `[Tool result (unmatched): call_id=${cleanId || "unknown"}]`;
+  }
+
+  const body = isError
+    ? (text ? `[Tool error]\n${text}` : "[Tool error]")
+    : text;
+
+  return body ? `${header}\n${body}` : header;
+}
+
+function pushSystemInstruction(pendingSystemParts, text) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  if (!trimmed) return;
+  if (pendingSystemParts[pendingSystemParts.length - 1] !== trimmed) {
+    pendingSystemParts.push(trimmed);
+  }
+}
+
+function applySystemPrefixToUserText(userText, pendingSystemParts) {
+  if (!pendingSystemParts.length) return userText;
+  const instructions = pendingSystemParts.splice(0).join("\n\n");
+  const systemBlock = `[System instructions]\n${instructions}`;
+  if (!userText) return systemBlock;
+  return `${systemBlock}\n\n[User message]\n${userText}`;
+}
+
+function buildUserMessage(textContent, imageParts, pendingSystemParts) {
+  const finalText = applySystemPrefixToUserText(textContent, pendingSystemParts);
+  if (imageParts.length > 0) {
+    const parts = [];
+    if (finalText.length > 0) {
+      parts.push({ type: "text", text: finalText });
+    }
+    parts.push(...imageParts);
+    return { role: "user", content: parts };
+  }
+  return { role: "user", content: finalText };
+}
+
+function normalizeOpenAIToolCalls(rawToolCalls, startIndex = 0) {
+  if (rawToolCalls === undefined || rawToolCalls === null) return [];
+  if (!Array.isArray(rawToolCalls)) {
+    throw new TypeError("Assistant tool_calls must be an array.");
+  }
+
+  const normalized = [];
+  for (const call of rawToolCalls) {
+    if (!isPlainObject(call) || !isPlainObject(call.function)) {
+      throw new TypeError("Each assistant tool_call must be an object with a function definition.");
+    }
+    const name = typeof call.function.name === "string" ? call.function.name.trim() : "";
+    if (!name) {
+      throw new TypeError("Each assistant tool_call must specify a non-empty function.name.");
+    }
+    const id = typeof call.id === "string" && call.id.trim()
+      ? call.id.trim()
+      : `call_${startIndex + normalized.length + 1}`;
+    const rawArgs = call.function.arguments;
+    const args = typeof rawArgs === "string"
+      ? rawArgs
+      : (isPlainObject(rawArgs) || Array.isArray(rawArgs)
+        ? JSON.stringify(rawArgs)
+        : JSON.stringify(rawArgs ?? {}));
+
+    normalized.push({
+      id,
+      type: "function",
+      function: { name, arguments: args },
+    });
+  }
+  return normalized;
 }
 
 /** Convert Anthropic Messages request bodies to OpenAI Chat Completions bodies. */
@@ -99,114 +254,337 @@ export function anthropicRequestToOpenAI(body, env = {}) {
   const model = map[requestedModel] || requestedModel;
 
   const messages = [];
-  const systemText = textFromContent(body.system);
-  if (systemText) messages.push({ role: "system", content: systemText });
+  const pendingSystemParts = [];
+  let pendingSystemFromHistory = false;
+  const pendingToolCalls = new Map();
+
+  const topLevelSystemText = extractInstructionText(body.system, "system");
+  if (topLevelSystemText) {
+    pushSystemInstruction(pendingSystemParts, topLevelSystemText);
+  }
 
   for (const message of body.messages) {
-    if (!message || !["user", "assistant"].includes(message.role)) {
-      throw new TypeError("Each message role must be user or assistant.");
+    if (!isPlainObject(message)) {
+      throw new TypeError("Each message must be a JSON object.");
+    }
+    if (typeof message.role !== "string" || !message.role.trim()) {
+      throw new TypeError("Each message must include a valid string role.");
     }
 
+    const role = message.role.trim();
+    if (!SUPPORTED_INPUT_ROLES.has(role)) {
+      const safeRole = role.replace(/[^\w:-]/g, "").slice(0, 64) || "unknown";
+      throw new TypeError(
+        `Unsupported message role "${safeRole}". Each message role must be normalized from user, assistant, system, developer, tool, or function.`,
+      );
+    }
+
+    if (role === "system" || role === "developer") {
+      if (typeof message.content !== "string" && !Array.isArray(message.content)) {
+        throw new TypeError(
+          `Invalid content for message role "${role}": content must be a string or content-block array.`,
+        );
+      }
+      if (Array.isArray(message.content) && message.content.length === 0) {
+        throw new TypeError(`Message with role "${role}" must not have an empty content array.`);
+      }
+      const instructionText = extractInstructionText(message.content, role);
+      if (!instructionText) {
+        throw new TypeError(`Message with role "${role}" must contain non-empty instruction text.`);
+      }
+      pushSystemInstruction(pendingSystemParts, instructionText);
+      if (messages.length > 0) {
+        pendingSystemFromHistory = true;
+      }
+      continue;
+    }
+
+    if (role === "assistant") {
+      if (pendingSystemFromHistory && pendingSystemParts.length > 0) {
+        messages.push({
+          role: "user",
+          content: `[System instructions]\n${pendingSystemParts.splice(0).join("\n\n")}`,
+        });
+        pendingSystemFromHistory = false;
+      }
+
+      const textParts = [];
+      const toolCalls = normalizeOpenAIToolCalls(message.tool_calls, 0);
+
+      if (isPlainObject(message.function_call)) {
+        const fnName = typeof message.function_call.name === "string"
+          ? message.function_call.name.trim()
+          : "";
+        if (!fnName) {
+          throw new TypeError("Assistant function_call must include a non-empty name.");
+        }
+        const rawArgs = message.function_call.arguments;
+        const args = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs ?? {});
+        toolCalls.push({
+          id: `call_${toolCalls.length + 1}`,
+          type: "function",
+          function: { name: fnName, arguments: args },
+        });
+      }
+
+      const content = message.content;
+      if (content === null || content === undefined) {
+        if (toolCalls.length === 0) {
+          throw new TypeError(
+            "Assistant message with null content must include at least one valid tool call.",
+          );
+        }
+      } else if (typeof content === "string") {
+        if (content.length === 0 && toolCalls.length === 0) {
+          throw new TypeError("Assistant message content must not be empty without tool calls.");
+        }
+        if (content.length > 0) textParts.push(content);
+      } else if (Array.isArray(content)) {
+        if (content.length === 0 && toolCalls.length === 0) {
+          throw new TypeError("Assistant message content array must not be empty.");
+        }
+        for (const block of content) {
+          if (!isPlainObject(block) || typeof block.type !== "string") {
+            throw new TypeError("Each content block in assistant message must be a typed object.");
+          }
+          if (block.type === "text") {
+            if (typeof block.text !== "string") {
+              throw new TypeError("Assistant text block must have a string text property.");
+            }
+            if (block.text.length > 0) textParts.push(block.text);
+          } else if (block.type === "tool_use") {
+            const name = typeof block.name === "string" ? block.name.trim() : "";
+            if (!name) {
+              throw new TypeError("Assistant tool_use block must include a non-empty string name.");
+            }
+            const id = typeof block.id === "string" && block.id.trim()
+              ? block.id.trim()
+              : `call_${toolCalls.length + 1}`;
+            const args = isPlainObject(block.input) || Array.isArray(block.input)
+              ? JSON.stringify(block.input)
+              : JSON.stringify(block.input ?? {});
+            toolCalls.push({
+              id,
+              type: "function",
+              function: { name, arguments: args },
+            });
+          } else if (block.type === "thinking" || block.type === "redacted_thinking") {
+            // Thinking/redacted-thinking blocks are intentionally omitted from
+            // upstream conversation history.
+          } else {
+            throw new TypeError(
+              `Unsupported content block type "${block.type.slice(0, 64)}" in assistant message.`,
+            );
+          }
+        }
+      } else {
+        throw new TypeError("Each message content must be a string or content-block array.");
+      }
+
+      const normalizeAssistantToolCallsToText = String(env.NORMALIZE_ASSISTANT_TOOL_CALLS ?? "0") === "1";
+      if (normalizeAssistantToolCallsToText && toolCalls.length > 0) {
+        for (const call of toolCalls) {
+          textParts.push(
+            `[Assistant tool call: ${call.function.name}, call_id=${call.id}]\nArguments: ${call.function.arguments}`,
+          );
+        }
+      }
+
+      const joinedText = textParts.join("\n");
+      const assistantMessage = {
+        role: "assistant",
+        content: joinedText.length > 0 ? joinedText : null,
+      };
+      if (toolCalls.length > 0 && !normalizeAssistantToolCallsToText) {
+        assistantMessage.tool_calls = toolCalls;
+      }
+
+      if (assistantMessage.content === null && (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0)) {
+        throw new TypeError("Assistant message produced no valid text content or tool calls.");
+      }
+
+      messages.push(assistantMessage);
+      pendingToolCalls.clear();
+      for (const call of toolCalls) {
+        pendingToolCalls.set(call.id, call.function.name);
+      }
+      continue;
+    }
+
+    if (role === "tool") {
+      const rawContent = message.content !== undefined ? message.content : message.output;
+      if (rawContent === undefined || rawContent === null) {
+        throw new TypeError('Message with role "tool" must include non-null content.');
+      }
+      const { text: resultText, images } = toolResultContentToParts(rawContent);
+      const callId = typeof message.tool_call_id === "string" && message.tool_call_id.trim()
+        ? message.tool_call_id.trim()
+        : (typeof message.id === "string" && message.id.trim() ? message.id.trim() : "");
+
+      const matched = Boolean(callId && pendingToolCalls.has(callId));
+      const matchedName = matched ? pendingToolCalls.get(callId) : "";
+      if (matched) pendingToolCalls.delete(callId);
+
+      const explicitName = typeof message.name === "string" && message.name.trim()
+        ? message.name.trim()
+        : "";
+      const toolName = explicitName || matchedName;
+
+      const formatted = formatToolResultMessage({
+        id: callId,
+        name: toolName,
+        text: resultText,
+        isError: Boolean(message.is_error),
+        matched,
+      });
+
+      messages.push(buildUserMessage(formatted, images, pendingSystemParts));
+      pendingSystemFromHistory = false;
+      continue;
+    }
+
+    if (role === "function") {
+      const fnName = typeof message.name === "string" ? message.name.trim() : "";
+      if (!fnName) {
+        throw new TypeError('Message with role "function" must include a non-empty string name.');
+      }
+      const rawContent = message.content !== undefined ? message.content : message.output;
+      if (rawContent === undefined || rawContent === null) {
+        throw new TypeError('Message with role "function" must include non-null content.');
+      }
+      const { text: resultText, images } = toolResultContentToParts(rawContent);
+      const callId = typeof message.tool_call_id === "string" && message.tool_call_id.trim()
+        ? message.tool_call_id.trim()
+        : "";
+
+      if (callId && pendingToolCalls.has(callId)) {
+        pendingToolCalls.delete(callId);
+      } else {
+        for (const [pendingId, pendingName] of pendingToolCalls.entries()) {
+          if (pendingName === fnName) {
+            pendingToolCalls.delete(pendingId);
+            break;
+          }
+        }
+      }
+
+      const formatted = formatToolResultMessage({
+        id: callId,
+        name: fnName,
+        text: resultText,
+        isError: Boolean(message.is_error),
+        matched: true,
+      });
+
+      messages.push(buildUserMessage(formatted, images, pendingSystemParts));
+      pendingSystemFromHistory = false;
+      continue;
+    }
+
+    // role === "user"
     const content = message.content;
     if (typeof content === "string") {
-      messages.push({ role: message.role, content });
+      pendingToolCalls.clear();
+      messages.push(buildUserMessage(content, [], pendingSystemParts));
+      pendingSystemFromHistory = false;
       continue;
     }
 
     if (!Array.isArray(content)) {
       throw new TypeError("Each message content must be a string or content-block array.");
     }
-
-    if (message.role === "assistant") {
-      const textParts = [];
-      const toolCalls = [];
-
-      for (const block of content) {
-        if (!block || typeof block !== "object") continue;
-        if (block.type === "text" && typeof block.text === "string") {
-          textParts.push(block.text);
-        } else if (block.type === "tool_use") {
-          const id = typeof block.id === "string" && block.id
-            ? block.id
-            : `call_${toolCalls.length + 1}`;
-          const name = typeof block.name === "string" && block.name ? block.name : "unknown_tool";
-          const args = isPlainObject(block.input) || Array.isArray(block.input)
-            ? JSON.stringify(block.input)
-            : JSON.stringify(block.input ?? {});
-          toolCalls.push({
-            id,
-            type: "function",
-            function: { name, arguments: args },
-          });
-        }
-        // Thinking/redacted-thinking blocks are intentionally not copied into
-        // a provider's normal conversation history.
-      }
-
-      const assistantMessage = {
-        role: "assistant",
-        content: textParts.join("\n") || null,
-      };
-      if (toolCalls.length) assistantMessage.tool_calls = toolCalls;
-      if (assistantMessage.content !== null || toolCalls.length) messages.push(assistantMessage);
-      continue;
+    if (content.length === 0) {
+      throw new TypeError("User message content array must not be empty.");
     }
 
-    const textParts = [];
+    const textSegments = [];
     const imageParts = [];
-    const toolResults = [];
 
     for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      if (block.type === "text" && typeof block.text === "string") {
-        textParts.push(block.text);
+      if (!isPlainObject(block) || typeof block.type !== "string") {
+        throw new TypeError("Each content block in user message must be a typed object.");
+      }
+
+      if (block.type === "text") {
+        if (typeof block.text !== "string") {
+          throw new TypeError("User text block must have a string text property.");
+        }
+        if (block.text.length > 0) {
+          textSegments.push(block.text);
+        }
       } else if (block.type === "image") {
         const mappedImage = anthropicImageToOpenAI(block);
-        if (mappedImage) imageParts.push(mappedImage);
+        if (!mappedImage) {
+          throw new TypeError("Unsupported or malformed image content block.");
+        }
+        imageParts.push(mappedImage);
       } else if (block.type === "tool_result") {
-        toolResults.push(block);
-      }
-    }
+        const callId = typeof block.tool_use_id === "string" && block.tool_use_id.trim()
+          ? block.tool_use_id.trim()
+          : (typeof block.tool_call_id === "string" && block.tool_call_id.trim()
+            ? block.tool_call_id.trim()
+            : "");
+        const matched = Boolean(callId && pendingToolCalls.has(callId));
+        const matchedName = matched ? pendingToolCalls.get(callId) : "";
+        if (matched) pendingToolCalls.delete(callId);
 
-    // OpenAI-compatible providers require tool messages directly after the
-    // assistant message containing the matching tool_calls. Unmatched results
-    // are represented as text instead of emitting an invalid orphan tool role.
-    const previous = messages[messages.length - 1];
-    const pendingIds = new Set(
-      previous?.role === "assistant" && Array.isArray(previous.tool_calls)
-        ? previous.tool_calls.map((call) => call.id)
-        : [],
-    );
-    const matched = [];
-    const unmatched = [];
+        const explicitName = typeof block.name === "string" && block.name.trim()
+          ? block.name.trim()
+          : "";
+        const toolName = explicitName || matchedName;
 
-    for (const result of toolResults) {
-      const id = result?.tool_use_id;
-      if (typeof id === "string" && pendingIds.has(id)) {
-        const toolContent = toolResultAsText(result);
-        matched.push({
-          role: "tool",
-          tool_call_id: id,
-          content: result?.is_error ? `[Tool error]
-${toolContent}` : toolContent,
+        const { text: resultText, images: nestedImages } = toolResultContentToParts(
+          block.content !== undefined ? block.content : (block.output ?? ""),
+        );
+        if (nestedImages.length > 0) {
+          imageParts.push(...nestedImages);
+        }
+
+        const formatted = formatToolResultMessage({
+          id: callId,
+          name: toolName,
+          text: resultText,
+          isError: Boolean(block.is_error),
+          matched,
         });
-        pendingIds.delete(id);
+        textSegments.push(formatted);
       } else {
-        unmatched.push(serializeUnmatchedToolResult(result));
+        throw new TypeError(
+          `Unsupported content block type "${block.type.slice(0, 64)}" in user message.`,
+        );
       }
     }
 
-    for (const toolMessage of matched) messages.push(toolMessage);
-    textParts.push(...unmatched);
+    pendingToolCalls.clear();
 
-    const hasUserText = textParts.join("\n").trim().length > 0;
-    if (imageParts.length) {
-      const parts = [];
-      if (hasUserText) parts.push({ type: "text", text: textParts.join("\n") });
-      parts.push(...imageParts);
-      messages.push({ role: "user", content: parts });
-    } else if (hasUserText) {
-      messages.push({ role: "user", content: textParts.join("\n") });
+    const combinedText = textSegments.join("\n");
+    if (combinedText.length === 0 && imageParts.length === 0 && pendingSystemParts.length === 0) {
+      throw new TypeError("User message produced no valid text or image content.");
+    }
+
+    messages.push(buildUserMessage(combinedText, imageParts, pendingSystemParts));
+    pendingSystemFromHistory = false;
+  }
+
+  if (pendingSystemParts.length > 0) {
+    const systemOnlyMessage = {
+      role: "user",
+      content: `[System instructions]\n${pendingSystemParts.splice(0).join("\n\n")}`,
+    };
+    if (messages.length > 0 && !pendingSystemFromHistory) {
+      messages.unshift(systemOnlyMessage);
+    } else {
+      messages.push(systemOnlyMessage);
+    }
+  }
+
+  if (messages.length === 0) {
+    throw new TypeError("Request must produce at least one upstream message.");
+  }
+
+  for (const msg of messages) {
+    if (!isPlainObject(msg) || !PERMITTED_UPSTREAM_ROLES.has(msg.role)) {
+      throw new Error("Upstream role policy violation: only user and assistant roles are permitted.");
     }
   }
 

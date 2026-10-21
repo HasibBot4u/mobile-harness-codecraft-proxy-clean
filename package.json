@@ -7,7 +7,8 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
-    "dev": "wrangler dev",
+    "build": "wrangler deploy --dry-run",
+    "dev": "wrangler dev --port 3000 --ip 0.0.0.0",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail mobile-harness-codecraft-proxy"
   },

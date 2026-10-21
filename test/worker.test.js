@@ -146,4 +146,141 @@ describe("Worker routes and security", () => {
     const response = await worker.fetch(makeRequest("/does-not-exist"), env);
     expect(response.status).toBe(404);
   });
+
+  it("16. guarantees the exact serialized upstream request contains only user and assistant roles while preserving system instructions, tool results, and order", async () => {
+    let capturedUrl = null;
+    let capturedHeaders = null;
+    let capturedBody = null;
+
+    const mockFetch = vi.fn(async (url, init) => {
+      capturedUrl = String(url);
+      capturedHeaders = init.headers;
+      capturedBody = JSON.parse(init.body);
+      return Response.json({
+        id: "chatcmpl-role-check",
+        model: "claude-opus-5.5",
+        choices: [{ message: { role: "assistant", content: "All normalized." }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 42, completion_tokens: 4 },
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const complexRequest = {
+      model: "claude-opus-5.5",
+      max_tokens: 256,
+      system: "Top-level system instruction.",
+      messages: [
+        { role: "system", content: "History system instruction." },
+        { role: "developer", content: "Developer policy instruction." },
+        { role: "user", content: [{ type: "text", text: "Inspect the repo." }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Checking files." },
+            { type: "tool_use", id: "call_101", name: "read_file", input: { path: "package.json" } },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "call_101", content: "{\"name\":\"demo\"}" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "call_102", type: "function", function: { name: "run_linter", arguments: "{}" } },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call_102",
+          content: "0 errors",
+        },
+        {
+          role: "function",
+          name: "legacy_check",
+          content: "ok",
+        },
+        {
+          role: "user",
+          content: "Summarize findings.",
+        },
+      ],
+    };
+
+    const response = await worker.fetch(makeRequest("/v1/messages", {
+      method: "POST",
+      apiKey: token,
+      body: complexRequest,
+    }), env);
+
+    expect(response.status).toBe(200);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(capturedUrl).toBe("https://codecraftapi.com/v1/chat/completions");
+    expect(capturedHeaders.authorization).toBe(`Bearer ${upstreamKey}`);
+    expect(capturedBody.model).toBe("claude-opus-5.5");
+
+    expect(Array.isArray(capturedBody.messages)).toBe(true);
+    expect(capturedBody.messages.length).toBe(7);
+    for (const msg of capturedBody.messages) {
+      expect(["user", "assistant"]).toContain(msg.role);
+    }
+
+    const combinedContent = capturedBody.messages
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+      .join("\n");
+    expect(combinedContent).toContain("Top-level system instruction.");
+    expect(combinedContent).toContain("History system instruction.");
+    expect(combinedContent).toContain("Developer policy instruction.");
+    expect(combinedContent).toContain("read_file");
+    expect(combinedContent).toContain("call_101");
+    expect(combinedContent).toContain("{\"name\":\"demo\"}");
+    expect(combinedContent).toContain("run_linter");
+    expect(combinedContent).toContain("call_102");
+    expect(combinedContent).toContain("0 errors");
+    expect(combinedContent).toContain("legacy_check");
+    expect(combinedContent).toContain("Summarize findings.");
+
+    expect(capturedBody.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "user",
+      "user",
+    ]);
+  });
+
+  it("17. returns a safe 400 error on unsupported roles without leaking credentials or private message content", async () => {
+    const mockFetch = vi.fn();
+    vi.stubGlobal("fetch", mockFetch);
+
+    const sensitiveContent = "PRIVATE_USER_SECRET_PROMPT_987654321";
+    const response = await worker.fetch(makeRequest("/v1/messages", {
+      method: "POST",
+      apiKey: token,
+      body: {
+        model: "claude-opus-5.5",
+        max_tokens: 64,
+        messages: [
+          { role: "moderator", content: sensitiveContent },
+        ],
+      },
+    }), env);
+
+    const data = await response.json();
+    const rawResponse = JSON.stringify(data);
+
+    expect(response.status).toBe(400);
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(data.type).toBe("error");
+    expect(data.error.type).toBe("invalid_request_error");
+    expect(data.error.message).toContain("moderator");
+    expect(rawResponse).not.toContain(sensitiveContent);
+    expect(rawResponse).not.toContain(upstreamKey);
+    expect(rawResponse).not.toContain(token);
+  });
 });

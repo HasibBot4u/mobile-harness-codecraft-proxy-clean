@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for diagnosing and resolving the CodeCraft 400 message role error via a strict user/assistant role-normalization layer, preserving system/developer instructions, tool calls, tool/function results, and multimodal content with full regression test coverage.",
+  "updatedAt":  "2026-10-21T15:09:38.825243892Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
